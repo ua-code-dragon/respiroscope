@@ -7,3 +7,4 @@ tables
 seaborn
 patsy
 statsmodels
+tqdm
