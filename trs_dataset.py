@@ -10,7 +10,7 @@ from typing import Any, Callable, Dict, Optional
 import pandas as pd
 from tqdm.auto import tqdm
 
-RecordProcessor = Callable[[dict[str, Any], dict[str, Any]], list[dict[str, Any]]]
+RecordProcessor = Callable[[pd.DataFrame, dict[str, Any]], pd.DataFrame]
 
 
 class TRSDataset:
@@ -56,20 +56,36 @@ class TRSDataset:
         index_filename: str = "dataset_index.csv",
         cache_filename: str = "dataset_cache.h5",
         cache_key: str = "trs_dataset",
-        max_records: Optional[int] = None,
+        max_files: Optional[int] = None,
     ) -> pd.DataFrame:
         """Load all CSV files into one normalized DataFrame with cache support."""
+        t_scan = time.perf_counter()
         files = sorted(self.data_dir.rglob(pattern))
+        self.logger.info(f"Scanned for files in {time.perf_counter() - t_scan:.2f} seconds")
         if not files:
             raise FileNotFoundError(f"No CSV files found under: {self.data_dir}")
-        self.logger.info("Discovered %d CSV files under %s", len(files), self.data_dir)
+        total_files = len(files)
+        if max_files is not None:
+            if max_files <= 0:
+                self.logger.info("max_files=%d, returning empty dataset.", max_files)
+                return pd.DataFrame(columns=list(self.REQUIRED_COLUMNS))
+            files = files[:max_files]
+            self.logger.info(
+                "Discovered %d CSV files under %s; processing first %d due to max_files.",
+                total_files,
+                self.data_dir,
+                len(files),
+            )
+        else:
+            self.logger.info("Discovered %d CSV files under %s", total_files, self.data_dir)
 
         index_path = self.cache_dir / index_filename
         cache_path = self.cache_dir / cache_filename
+        cache_enabled = use_cache
 
         current_index = self._build_index(files)
 
-        if use_cache and not force_reload and index_path.exists() and cache_path.exists():
+        if cache_enabled and not force_reload and index_path.exists() and cache_path.exists():
             saved_index = self._read_index(index_path)
             if self._index_matches(current_index, saved_index):
                 try:
@@ -81,7 +97,6 @@ class TRSDataset:
                     ) from exc
 
         frames: list[pd.DataFrame] = []
-        n_processed = 0
         show_record_progress = bool(self.enable_progress and max_workers == 1)
         if max_workers == 1:
             iterator = tqdm(
@@ -93,10 +108,6 @@ class TRSDataset:
             )
             for file_path in iterator:
                 frames.append(self.load_file(file_path, show_progress=show_record_progress))
-                n_processed += 1
-                if max_records is not None and n_processed >= max_records:
-                    self.logger.info("Reached max_records limit (%d), stopping load.", max_records)
-                    break
         else:
             with ThreadPoolExecutor(max_workers=max_workers) as pool:
                 futures = {pool.submit(self.load_file, file_path): file_path for file_path in files}
@@ -110,10 +121,6 @@ class TRSDataset:
                     file_path = futures[future]
                     try:
                         frames.append(future.result())
-                        n_processed += 1
-                        if max_records is not None and n_processed >= max_records:
-                            self.logger.info("Reached max_records limit (%d), stopping load.", max_records)
-                            break
                     except Exception:
                         self.logger.exception("Failed while processing file: %s", file_path)
                         raise
@@ -122,8 +129,8 @@ class TRSDataset:
         self.logger.info("Loaded %d records after preprocessing", len(df))
 
         # Persist cache artifacts for fast reloads.
-        current_index.to_csv(index_path, index=False)
-        if use_cache:
+        if cache_enabled:
+            current_index.to_csv(index_path, index=False)
             try:
                 df.to_hdf(cache_path, key=cache_key, mode="w")
                 self.logger.info("Updated cache at %s", cache_path)
@@ -131,6 +138,8 @@ class TRSDataset:
                 raise ImportError(
                     "HDF5 cache requires the 'tables' package. Install it or call load_all(..., use_cache=False)."
                 ) from exc
+        else:
+            self.logger.info("Skipping cache read/write.")
 
         return df
 
@@ -180,13 +189,16 @@ class TRSDataset:
             #    df["time"] = pd.to_numeric(df[time_col], errors="coerce")
             df["time"] = pd.to_numeric(df[time_col], errors="coerce")
 
-        processed = self._apply_record_processor(
-            df=df,
-            path=path,
-            spo2_col=spo2_col,
-            fio2_col=fio2_col,
-            show_progress=show_progress,
-        )
+        processor_state: dict[str, Any] = {
+            "path": path,
+            "spo2_col": spo2_col,
+            "fio2_col": fio2_col,
+            "show_progress": show_progress,
+            "enable_progress": self.enable_progress,
+        }
+        processed = self.record_processor(df, processor_state)
+        if not isinstance(processed, pd.DataFrame):
+            raise TypeError("record_processor must return a pandas DataFrame")
         if processed.empty:
             self.logger.warning("No valid records left after preprocessing: %s", path)
             return pd.DataFrame(columns=list(self.REQUIRED_COLUMNS))
@@ -203,51 +215,6 @@ class TRSDataset:
         ordered_cols = required + optional
 
         return processed.reindex(columns=ordered_cols)
-
-    def _apply_record_processor(
-        self,
-        *,
-        df: pd.DataFrame,
-        path: Path,
-        spo2_col: str,
-        fio2_col: str,
-        show_progress: bool,
-    ) -> pd.DataFrame:
-        state: dict[str, Any] = {
-            "path": path,
-            "last_fio2": None,
-            "pending_records": [],
-        }
-        output_rows: list[dict[str, Any]] = []
-
-        iterator = df.iterrows()
-        use_tqdm = bool(
-            show_progress and self.enable_progress and threading.current_thread() is threading.main_thread()
-        )
-        if use_tqdm:
-            iterator = tqdm(
-                iterator,
-                total=len(df),
-                desc=f"Preprocessing {path.name}",
-                unit="row",
-                leave=False,
-            )
-
-        for row_index, row in iterator:
-            record = row.to_dict()
-            record["FiO2"] = row.get(fio2_col)
-            record["SpO2"] = row.get(spo2_col)
-            record["row_index"] = row_index
-            emitted = self.record_processor(record, state)
-            if emitted:
-                output_rows.extend(emitted)
-
-        pending = state.get("pending_records")
-        if pending:
-            # Matching fill.py behavior: unresolved initial rows stay dropped if FiO2 never appears.
-            self.logger.debug("Dropping %d unresolved pending records from %s", len(pending), path)
-
-        return pd.DataFrame(output_rows)
 
     def _toss_validate_file(
         self, df: pd.DataFrame, los_col: Optional[str], fio2_col: str, spo2_col: str
@@ -267,44 +234,69 @@ class TRSDataset:
 
         rows_limit = math.ceil(los_value * 24.0)
         if rows_limit < self.min_lines:
-            return False, f"Short file ({los_value=} {rows_limit=})", rows_limit
+            return False, f"Short file ({los_value=:.4g} {rows_limit=})", rows_limit
         return True, "", rows_limit
 
     @staticmethod
-    def default_record_processor(record: dict[str, Any], state: dict[str, Any]) -> list[dict[str, Any]]:
-        """Default per-record preprocessing adapted from fill.py rules."""
-        fio2 = TRSDataset._to_float(record.get("FiO2"))
-        spo2 = TRSDataset._to_float(record.get("SpO2"))
+    def default_record_processor(df: pd.DataFrame, state: dict[str, Any]) -> pd.DataFrame:
+        """Default preprocessing adapted from fill.py rules, applied to one file DataFrame."""
+        path = state["path"]
+        spo2_col = state["spo2_col"]
+        fio2_col = state["fio2_col"]
+        show_progress = state.get("show_progress", False)
+        enable_progress = state.get("enable_progress", True)
 
-        if fio2 is not None and (fio2 < 20 or fio2 > 100.0):
-            return []
-        if spo2 is None or spo2 < 80 or spo2 > 100.0:
-            return []
+        last_fio2: Optional[float] = None
+        pending_records: list[dict[str, Any]] = []
+        output_rows: list[dict[str, Any]] = []
 
-        pending: list[dict[str, Any]] = state.setdefault("pending_records", [])
-        emitted: list[dict[str, Any]] = []
+        iterator = df.iterrows()
+        use_tqdm = bool(
+            show_progress and enable_progress and threading.current_thread() is threading.main_thread()
+        )
+        if use_tqdm:
+            iterator = tqdm(
+                iterator,
+                total=len(df),
+                desc=f"Preprocessing {path.name}",
+                unit="row",
+                leave=False,
+            )
 
-        if fio2 is None:
-            if state.get("last_fio2") is None:
-                pending_record = dict(record)
-                pending_record["SpO2"] = spo2
-                pending_record["FiO2"] = None
-                pending.append(pending_record)
-                return []
-            fio2 = state["last_fio2"]
-        else:
-            state["last_fio2"] = fio2
-            if pending:
-                for pending_record in pending:
-                    pending_record["FiO2"] = fio2
-                emitted.extend(pending)
-                pending.clear()
+        for row_index, row in iterator:
+            record = row.to_dict()
+            fio2 = TRSDataset._to_float(row.get(fio2_col))
+            spo2 = TRSDataset._to_float(row.get(spo2_col))
 
-        cleaned = dict(record)
-        cleaned["FiO2"] = fio2
-        cleaned["SpO2"] = spo2
-        emitted.append(cleaned)
-        return emitted
+            if fio2 is not None and (fio2 < 20 or fio2 > 100.0):
+                continue
+            if spo2 is None or spo2 < 80 or spo2 > 100.0:
+                continue
+
+            if fio2 is None:
+                if last_fio2 is None:
+                    pending_record = dict(record)
+                    pending_record["SpO2"] = spo2
+                    pending_record["FiO2"] = None
+                    pending_record["row_index"] = row_index
+                    pending_records.append(pending_record)
+                    continue
+                fio2 = last_fio2
+            else:
+                last_fio2 = fio2
+                if pending_records:
+                    for pending_record in pending_records:
+                        pending_record["FiO2"] = fio2
+                    output_rows.extend(pending_records)
+                    pending_records.clear()
+
+            cleaned = dict(record)
+            cleaned["FiO2"] = fio2
+            cleaned["SpO2"] = spo2
+            cleaned["row_index"] = row_index
+            output_rows.append(cleaned)
+
+        return pd.DataFrame(output_rows)
 
     def _build_index(self, files: list[Path]) -> pd.DataFrame:
         rows = []
@@ -386,8 +378,8 @@ if __name__ == "__main__":
     loader = TRSDataset()
     start_time = time.perf_counter()
     # df = loader.load_all(max_workers=8, use_cache=False)
-    # df = loader.load_all(max_workers=8, use_cache=True)
-    df = loader.load_all(max_workers=1, use_cache=False, max_records=100)
+    df = loader.load_all(max_workers=8, use_cache=True)
+    # df = loader.load_all(max_workers=8, use_cache=False, max_files=100)
     elapsed = time.perf_counter() - start_time
     print(f"Loaded dataset with {len(df)} records in {elapsed:.2f} seconds.\n")
     print(df.head())
