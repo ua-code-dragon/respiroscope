@@ -209,3 +209,6 @@ __marimo__/
 # Project specific
 dataset_cache*
 dataset_index*
+
+# Raw data files
+data/**
