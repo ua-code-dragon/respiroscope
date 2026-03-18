@@ -1,0 +1,10 @@
+matplotlib
+mpmath
+numpy
+pandas
+scipy
+tables
+seaborn
+patsy
+statsmodels
+tqdm
